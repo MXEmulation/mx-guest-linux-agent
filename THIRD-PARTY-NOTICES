@@ -1,0 +1,75 @@
+THIRD-PARTY NOTICES: mx-guest-linux-agent
+
+This file lists third-party work carried in this repository or shipped
+from it, with the SPDX licence identifier, the copyright holders and the
+source location of each.
+
+
+THIRD-PARTY WORK CARRIED IN THIS REPOSITORY
+
+None. At present this repository carries no third-party work. Every file
+in it other than the licence texts (LICENCE and LICENSES/) is MX's
+own work, licensed under GPL-2.0-only
+(SPDX identifier GPL-2.0-only), copyright 2026 Zak Noble-Clarke,
+as stated in each file's SPDX header or in REUSE.toml.
+
+
+MX DEPENDENCIES
+
+These are MX's own repositories, not third-party work. They will be
+carried as git submodules pinned to exact commits, and their files are
+compiled into the agent programs.
+
+  mx-guest-core
+    Path:      deps/core
+    Licence:   MIT (SPDX identifier MIT)
+    Copyright: 2026 Zak Noble-Clarke
+    Source:    https://github.com/MXEmulation/mx-guest-core
+
+  mx-guest-linux-common
+    Path:      deps/linux-common
+    Licence:   MIT (SPDX identifier MIT)
+    Copyright: 2026 Zak Noble-Clarke
+    Source:    https://github.com/MXEmulation/mx-guest-linux-common
+
+
+BUILD INPUTS, NOT REDISTRIBUTED
+
+  Linux kernel uapi headers
+    Licence:   GPL-2.0-only WITH Linux-syscall-note (the kernel's
+               user-space API headers, which this exception covers)
+    Source:    the guest distribution's kernel headers package
+    Not copied or shipped.
+
+  The guest's C library
+    Dynamically linked from the guest's own installation and not shipped
+    (for glibc, LGPL-2.1-or-later).
+
+  Other libraries
+    Undecided.
+
+The other libraries the daemon and its clients will link have not
+been chosen; README.md lists the open choices (the clipboard client's
+route to the display server, the FUSE library, and desktop integration).
+When a component comes to link a library, it is recorded in that
+component's link-dependency list with its SPDX licence identifier, and
+listed here:
+
+  - in this section, if the programs are built against the guest's own
+    installed copy of the library and no copy of it is placed in this
+    repository or shipped from it; or
+
+  - under "Third-party work carried in this repository", with its
+    notices, if any copy of it is vendored, bundled, statically linked
+    into a shipped binary, or otherwise shipped.
+
+
+WHEN AN ENTRY MUST BE ADDED
+
+A build-time dependency creates no notice obligation. A shipped copy
+creates one immediately. As soon as any third-party file, fragment,
+vendored library or generated artefact derived from third-party work is
+placed in this repository, or shipped from it, it must be listed here in
+the same commit, with its original notices kept intact. A library that is
+statically linked into a distributed binary, or copied onto a release
+image so that an offline install works, is a shipped copy.
