@@ -1,0 +1,8 @@
+{
+  "uuid": "mx-session@coretools.app",
+  "name": "MX Guest Session",
+  "description": "Local native window inventory, application catalogue and session actions",
+  "shell-version": ["50"],
+  "session-modes": ["user"],
+  "url": "https://github.com/MXEmulation/mx-guest-linux-agent"
+}

@@ -16,9 +16,9 @@ as stated in each file's SPDX header or in REUSE.toml.
 
 MX DEPENDENCIES
 
-These are MX's own repositories, not third-party work. They will be
-carried as git submodules pinned to exact commits, and their files are
-compiled into the agent programs.
+These are MX's own repositories, not third-party work. They are carried
+as git submodules pinned to exact commits. The daemon compiles Core's
+agent codecs; Linux Common defines the planned local-client ABI.
 
   mx-guest-core
     Path:      deps/core
@@ -46,10 +46,14 @@ BUILD INPUTS, NOT REDISTRIBUTED
     (for glibc, LGPL-2.1-or-later).
 
   Other libraries
-    Undecided.
+    The session bridge runs in the already installed GNOME Shell and
+    uses its existing GJS, Mutter, GLib, GObject and GIO interfaces.
+    No additional binary is linked against them and no runtime copy is
+    shipped. The component's interfaces and SPDX identifiers are listed
+    in session-bridge/DEPENDENCIES.md.
 
-The other libraries the daemon and its clients will link have not
-been chosen; README.md lists the open choices (the clipboard client's
+The other libraries the daemon and its compiled clients will link have
+not been chosen; README.md lists the open choices (the clipboard client's
 route to the display server, the FUSE library, and desktop integration).
 When a component comes to link a library, it is recorded in that
 component's link-dependency list with its SPDX licence identifier, and

@@ -7,7 +7,7 @@ SPDX-PackageDownloadLocation = "https://github.com/MXEmulation/mx-guest-linux-ag
 # or where a header would be noise. Every source file carries its own
 # SPDX-License-Identifier and SPDX-FileCopyrightText header instead.
 [[annotations]]
-path = ["README.md", "THIRD-PARTY-NOTICES", "REUSE.toml", ".gitignore", ".gitmodules", ".github/**", "CONTRIBUTING.md"]
+path = ["README.md", "THIRD-PARTY-NOTICES", "REUSE.toml", ".gitignore", ".gitmodules", ".github/**", "CONTRIBUTING.md", "session-bridge/metadata.json"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Zak Noble-Clarke"
 SPDX-License-Identifier = "GPL-2.0-only"
