@@ -13,7 +13,8 @@ mx_dkms_added=0
 mx_prefix=
 mx_dkms_source=
 mx_fingerprint=
-mx_prior_dkms=
+mx_keep_dkms_source=0
+mx_keep_prefix=0
 mx_dkms=(dkms --dkmstree /var/lib/dkms --sourcetree /usr/src --installtree /lib/modules --directive modprobe_on_install= --directive post_transaction=)
 
 while (($#)); do
@@ -102,7 +103,19 @@ if [[ $mx_mode == plan ]]; then
     printf 'Kernel: %s\nArchitecture: %s\nGPU present: %s\nActivation: next boot\n' "$mx_kernel" "$mx_arch" "$mx_gpu_present"
     printf 'Packages: '; printf '%q ' "${mx_packages[@]}"; printf '\n'
     for mx_key in "${mx_keys[@]}"; do printf '%s\t%s\t%s\n' "$mx_key" "${mx_url[$mx_key]}" "${mx_commit[$mx_key]}"; done
-    printf '%s\n' 'Existing guest-agent binaries and services will be preserved.'
+    printf '%s\n' 'Uninstall before installing (running services and loaded modules are not stopped; activation is at next boot):'
+    mx_plan_found=0
+    if command -v dkms >/dev/null; then
+        for mx_name in mxguest-agent mxgpu; do
+            while IFS=$'\t' read -r mx_version mx_flag; do
+                [[ -n $mx_version ]] || continue
+                printf '  dkms:%s/%s\n' "$mx_name" "$mx_version"; mx_plan_found=1
+            done < <(mx_dkms_registrations "$mx_name" "$mx_kernel" "${mx_dkms[@]}" 2>/dev/null || true)
+        done
+    fi
+    while IFS= read -r mx_item; do printf '  %s\n' "$mx_item"; mx_plan_found=1; done < <(mx_scan_footprint '' "$mx_kernel")
+    ((mx_plan_found)) || printf '%s\n' '  (no previous guest additions found)'
+    printf '%s\n' 'Install: the mxgpu and mxguest modules through DKMS, the graphics stack, the guest agent service and, when GNOME Shell is installed, the session bridge extension with its autostart entry.'
     exit 0
 fi
 mx_exit() {
@@ -118,16 +131,16 @@ mx_exit() {
             else
                 rollback_failed=1
             fi
-            mx_restore_prior_dkms "$mx_kernel" "$mx_prior_dkms" "${mx_dkms[@]}" || rollback_failed=1
         fi
-        [[ -z $mx_dkms_source ]] || rm -rf -- "$mx_dkms_source"
-        [[ -z $mx_prefix ]] || rm -rf -- "$mx_prefix"
+        mx_restore_removed_dkms "$mx_kernel" "${mx_dkms[@]}" || rollback_failed=1
+        [[ -z $mx_dkms_source ]] || ((mx_keep_dkms_source)) || rm -rf -- "$mx_dkms_source"
+        [[ -z $mx_prefix ]] || ((mx_keep_prefix)) || rm -rf -- "$mx_prefix"
         timeout 60 depmod -a "$mx_kernel" || rollback_failed=1
         timeout 30 systemctl daemon-reload || rollback_failed=1
         if ((rollback_failed)); then
             printf 'Installation failed and restoration was incomplete. Retained backup: %s\n' "$mx_backup_dir" >&2
         else
-            printf 'Installation failed. Existing configuration and prior DKMS version were restored. Backup: %s\n' "$mx_backup_dir" >&2
+            printf 'Installation failed. Previous files and DKMS registrations were restored. Backup: %s\n' "$mx_backup_dir" >&2
         fi
     fi
     exit "$status"
@@ -211,10 +224,18 @@ mx_run timeout 900 make -C "${mx_path[common]}" test
 mx_run timeout 900 make -C "${mx_path[agent]}" check
 mx_jobs=$(getconf _NPROCESSORS_ONLN); ((mx_jobs <= 8)) || mx_jobs=8
 mx_run timeout 1800 make -C "$mx_headers" "M=${mx_path[kernel]}/mxgpu" "-j$mx_jobs" modules
-mx_module="${mx_path[kernel]}/mxgpu/mxgpu.ko"
-mx_vermagic=$(modinfo -F vermagic "$mx_module")
-[[ ${mx_vermagic%% *} == "$mx_kernel" && $(modinfo -F license "$mx_module") == GPL ]] || mx_fail 'Built module kernel or licence mismatch'
+mx_run timeout 1800 make -C "$mx_headers" "M=${mx_path[kernel]}/mxguest" "-j$mx_jobs" modules
+for mx_module in "${mx_path[kernel]}/mxgpu/mxgpu.ko" "${mx_path[kernel]}/mxguest/mxguest.ko"; do
+    mx_vermagic=$(modinfo -F vermagic "$mx_module")
+    [[ ${mx_vermagic%% *} == "$mx_kernel" && $(modinfo -F license "$mx_module") == GPL ]] || mx_fail "Built module kernel or licence mismatch: $mx_module"
+done
 mx_run python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'
+rm -rf -- "$mx_build_workspace/session-bridge"
+mx_run python3 "${mx_path[agent]}/session-bridge/build-package.py" --core "${mx_path[agent]}/deps/core" --output "$mx_build_workspace/session-bridge"
+mx_bridge_uuid=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["uuid"])' "${mx_path[agent]}/session-bridge/metadata.json") || mx_fail 'Cannot read the session bridge identifier'
+[[ $mx_bridge_uuid =~ ^[A-Za-z0-9._@-]+$ ]] || mx_fail 'Invalid session bridge identifier'
+mx_bridge_package="$mx_build_workspace/session-bridge/$mx_bridge_uuid"
+[[ -d $mx_bridge_package ]] || mx_fail 'Session bridge package was not staged'
 mx_meson=$(command -v meson)
 mx_meson_version=$($mx_meson --version)
 IFS=. read -r mx_major mx_minor mx_patch <<< "$mx_meson_version"
@@ -225,9 +246,6 @@ if ((mx_major < 1 || (mx_major == 1 && mx_minor < 4))); then
 fi
 mx_prefix="/opt/mxgpu/releases/$mx_fingerprint"
 mx_dkms_source="/usr/src/mxgpu-$mx_fingerprint"
-if [[ $mx_mode == install ]]; then
-    [[ ! -e $mx_prefix && ! -e $mx_dkms_source ]] || mx_fail 'This source release is already installed'
-fi
 mx_setup=("$mx_meson" setup)
 [[ ! -f $mx_build_workspace/mesa-build/build.ninja ]] || mx_setup+=(--reconfigure)
 mx_run timeout 900 "${mx_setup[@]}" "$mx_build_workspace/mesa-build" "${mx_path[mesa]}" -Dgallium-drivers=mxgpu -Dvulkan-drivers=mxgpu -Dplatforms=x11,wayland -Dllvm=disabled -Dglx=dri -Degl=enabled -Dgbm=enabled -Dgles1=disabled -Dgles2=enabled -Dbuild-tests=false -Dvideo-codecs= --wrap-mode=nodownload --buildtype=release "--prefix=$mx_prefix" --libdir=lib
@@ -241,10 +259,22 @@ if [[ $mx_mode == build ]]; then
     exit 0
 fi
 mx_backup_dir=$(mktemp -d "$mx_build_workspace/rollback-XXXXXXXX")
-mx_prior_dkms=$(mx_dkms_installed_version "$mx_kernel" "${mx_dkms[@]}") || mx_fail 'Cannot identify the prior installed DKMS version'
-mx_existing_dkms=$(timeout 30 "${mx_dkms[@]}" status -m mxgpu -v "$mx_fingerprint") || mx_fail 'Cannot verify DKMS release ownership'
-[[ -z $mx_existing_dkms ]] || mx_fail 'This source release already has a DKMS registration'
 mx_transaction_active=1
+for mx_name in mxguest-agent mxgpu; do
+    mx_remove_dkms_package "$mx_name" "$mx_kernel" "${mx_dkms[@]}" || mx_fail "Cannot remove the DKMS registrations of $mx_name"
+done
+mx_deferred=()
+mx_footprint_list=$(mx_scan_footprint '' "$mx_kernel")
+while IFS= read -r mx_item; do
+    [[ -n $mx_item ]] || continue
+    case $mx_item in
+        "$mx_dkms_source") mx_keep_dkms_source=1; mx_remove_path "$mx_item" ;;
+        "$mx_prefix") mx_keep_prefix=1; mx_remove_path "$mx_item" ;;
+        /usr/src/mxguest-agent-*|/usr/src/mxgpu-*|/opt/mxgpu/releases/*) mx_deferred+=("$mx_item") ;;
+        *) mx_remove_footprint_item "$mx_item" ;;
+    esac
+    mx_uninstalled+=("$mx_item")
+done <<< "$mx_footprint_list"
 mkdir -p -- "$(dirname -- "$mx_prefix")"
 cp -a -- "$mx_stage$mx_prefix" "$mx_prefix"
 for mx_key in core common kernel; do
@@ -258,18 +288,7 @@ for mx_dep in core linux-common; do
     mkdir -p -- "$mx_target"
     mx_export_source "${mx_path[$mx_owner]}" "$mx_target"
 done
-cat > "$mx_dkms_source/dkms.conf" <<EOF
-# SPDX-License-Identifier: GPL-2.0-only
-# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
-PACKAGE_NAME="mxgpu"
-PACKAGE_VERSION="$mx_fingerprint"
-BUILT_MODULE_NAME[0]="mxgpu"
-BUILT_MODULE_LOCATION[0]="linux/kernel-modules/mxgpu"
-DEST_MODULE_LOCATION[0]="/updates/dkms"
-AUTOINSTALL="yes"
-MAKE[0]="make -C linux/kernel-modules/mxgpu KDIR=/lib/modules/\${kernelver}/build modules"
-CLEAN="make -C linux/kernel-modules/mxgpu KDIR=/lib/modules/\${kernelver}/build clean"
-EOF
+mx_render_dkms_conf "$mx_fingerprint" 1 > "$mx_dkms_source/dkms.conf"
 mx_dkms_added=1
 mx_run timeout 900 "${mx_dkms[@]}" add -m mxgpu -v "$mx_fingerprint"
 mx_run timeout 1800 "${mx_dkms[@]}" build -m mxgpu -v "$mx_fingerprint" -k "$mx_kernel"
@@ -290,27 +309,25 @@ EOF
 mx_replace_file /etc/environment.d/70-mxgpu.conf "$mx_configuration/environment"
 { printf '%s\n' '# SPDX-License-Identifier: GPL-2.0-only' '# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke'; while IFS= read -r mx_line; do [[ $mx_line == \#* ]] || printf 'export %s\n' "$mx_line"; done < "$mx_configuration/environment"; } > "$mx_configuration/profile"
 mx_replace_file /etc/profile.d/mxgpu.sh "$mx_configuration/profile"
-printf '%s\n' '# SPDX-License-Identifier: GPL-2.0-only' '# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke' mxgpu > "$mx_configuration/modules"
+printf '%s\n' '# SPDX-License-Identifier: GPL-2.0-only' '# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke' mxgpu mxguest > "$mx_configuration/modules"
 mx_replace_file /etc/modules-load.d/mxgpu.conf "$mx_configuration/modules"
 mx_run python3 "$mx_script_dir/manifest-helper.py" --icd "$mx_prefix/share/vulkan/icd.d/mxgpu_icd.json" --output "$mx_configuration/icd.json"
 mx_replace_file /usr/share/vulkan/icd.d/mxgpu_icd.json "$mx_configuration/icd.json"
-mx_agent_preserved=0
-if [[ -e /usr/local/sbin/mxguest-agentd || -e /etc/systemd/system/mxguest-agent.service || -e /usr/lib/systemd/system/mxguest-agent.service ]] || command -v mxguest-agentd >/dev/null; then
-    mx_agent_preserved=1
-    mx_install_preserved_service_compat "$mx_script_dir"
-else
-    mx_replace_file /usr/local/sbin/mxguest-agentd "${mx_path[agent]}/build/mxguest-agentd" 755
-    cat > "$mx_configuration/agent.service" <<'EOF'
+mx_bridge_installed=none
+mx_replace_file /usr/local/sbin/mxguest-agentd "${mx_path[agent]}/build/mxguest-agentd" 755
+cat > "$mx_configuration/agent.service" <<'EOF'
 # SPDX-License-Identifier: GPL-2.0-only
 # SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
 [Unit]
-Description=MX guest reporting and power service
+Description=MX guest agent
 ConditionPathExists=/dev/mxguest-agent
 After=systemd-udev-settle.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/mxguest-agentd
+RuntimeDirectory=mxguest-agent
+RuntimeDirectoryMode=0755
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -319,11 +336,31 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    mx_replace_file /etc/systemd/system/mxguest-agent.service "$mx_configuration/agent.service"
-    mx_replace_link /etc/systemd/system/multi-user.target.wants/mxguest-agent.service /etc/systemd/system/mxguest-agent.service
+mx_replace_file /etc/systemd/system/mxguest-agent.service "$mx_configuration/agent.service"
+mx_replace_link /etc/systemd/system/multi-user.target.wants/mxguest-agent.service /etc/systemd/system/mxguest-agent.service
+if command -v gnome-shell >/dev/null; then
+    mx_replace_dir "/usr/share/gnome-shell/extensions/$mx_bridge_uuid" "$mx_bridge_package"
+    cat > "$mx_configuration/session-bridge.desktop" <<EOF
+# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
+[Desktop Entry]
+Type=Application
+Name=MX guest session bridge
+Exec=gnome-extensions enable $mx_bridge_uuid
+OnlyShowIn=GNOME;
+NoDisplay=true
+EOF
+    mx_replace_file /etc/xdg/autostart/mxguest-session-bridge.desktop "$mx_configuration/session-bridge.desktop"
+    mx_bridge_installed=$mx_bridge_uuid
 fi
 mx_run timeout 30 systemctl daemon-reload
 mx_run depmod -a "$mx_kernel"
-printf 'release\t%s\nkernel\t%s\nbackup\t%s\nexisting_agent_preserved\t%s\nactivation\tnext boot\n' "$mx_prefix" "$mx_kernel" "$mx_backup_dir" "$mx_agent_preserved" > "$mx_build_workspace/installed.tsv"
+mx_uninstalled_list=none
+if ((${#mx_uninstalled[@]})); then mx_uninstalled_list=$(IFS=,; printf '%s' "${mx_uninstalled[*]}"); fi
+printf 'release\t%s\nkernel\t%s\nbackup\t%s\nuninstalled\t%s\nsession_bridge\t%s\ntransport_module\tmxguest\nactivation\tnext boot\n' "$mx_prefix" "$mx_kernel" "$mx_backup_dir" "$mx_uninstalled_list" "$mx_bridge_installed" > "$mx_build_workspace/installed.tsv"
 mx_transaction_active=0
-printf '%s\n' 'Installed MXGPU. Reboot to activate the module and graphics stack. Existing guest services were preserved.'
+mx_discard_retired
+for mx_item in ${mx_deferred[@]+"${mx_deferred[@]}"}; do rm -rf -- "$mx_item"; done
+mx_summary='the mxgpu and mxguest modules, the graphics stack and the guest agent'
+[[ $mx_bridge_installed == none ]] || mx_summary+=" and the session bridge ($mx_bridge_installed)"
+printf 'Uninstalled %s previous items and installed %s. Running services and loaded modules were not stopped or unloaded; reboot to activate.\n' "${#mx_uninstalled[@]}" "$mx_summary"

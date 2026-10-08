@@ -36,7 +36,7 @@ bash install/test-install.sh
 
 The installer supports apt-get, dnf and pacman. Mesa requires Python 3.10 or newer; module installation requires Linux 6.6 or newer on x86_64 or AArch64. Full installation on every supported distribution has not been validated. Package downloads and builds are bounded, and installation failures restore saved configuration.
 
-An existing agent binary and service are retained. A loaded `mxguest-agent.service` receives a transactional power compatibility drop-in for its next start, without restarting the agent. Fresh installations use the daemon's implemented features and condition the service on the device node. The installer tests cover manifest refusals, rollback, retained-service compatibility and verified source-cache reuse.
+The installer first uninstalls the previously installed guest additions (agent services, user services, helpers, transport and earlier MXGPU releases), with rollback on failure; `--plan` lists what it finds. Running services are not stopped and loaded modules are not unloaded, so activation is at next boot. It then installs the daemon's implemented features as a service conditioned on the device node, registers the `mxguest` transport module (providing `/dev/mxguest-agent`) beside `mxgpu`, and, when GNOME Shell is installed, installs the session bridge extension with an XDG autostart entry that enables it, which carries clipboard sharing. The installer tests cover manifest refusals, rollback, uninstall footprint scanning and removal, and verified source-cache reuse.
 
 ## Licence
 
