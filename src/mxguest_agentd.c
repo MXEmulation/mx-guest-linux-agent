@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* SPDX-FileCopyrightText: 2026 Zak Noble-Clarke */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+#include "clipboard.h"
 #include "mxga.h"
 #include "power.h"
 
@@ -11,13 +12,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #define AGENT_DEVICE "/dev/mxguest-agent"
 #define AGENT_CAPS (MXGA_CAP_SHUTDOWN | MXGA_CAP_RESTART | MXGA_CAP_SYSTEM_STATS)
 
+#ifndef SESSION_DIR
+#define SESSION_DIR "/run/mxguest-agent"
+#endif
+#define SESSION_SOCKET SESSION_DIR "/session.sock"
+#ifndef SEAT_STATE
+#define SEAT_STATE "/run/systemd/seats/seat0"
+#endif
+
+struct session_client {
+    int fd;
+    struct mxguest_clip_in in;
+    struct mxguest_clip_out out;
+};
+
 static uint64_t g_sequence = 1;
+static uint8_t *g_send;
+static uint8_t *g_payload;
+static struct mxguest_clip g_clip;
+static int g_clip_ready;
+static int g_listen = -1;
+static struct session_client g_client = {.fd = -1};
 
 static int write_all(int fd, const uint8_t *buf, uint32_t len)
 {
@@ -40,23 +64,25 @@ static int write_all(int fd, const uint8_t *buf, uint32_t len)
 
 static int send_frame(int fd, uint16_t opcode, const uint8_t *payload, uint32_t payload_len)
 {
-    uint8_t frame[4096];
     uint32_t len = 0;
-    if (payload_len + MXGA_HEADER_BYTES > sizeof frame)
+    if (!g_send)
+        g_send = malloc(MXGA_MAX_FRAME_BYTES);
+    if (!g_send)
         return -1;
-    if (mxga_encode_frame(MXGA_PROTOCOL_MINOR, opcode, g_sequence++, payload, payload_len, frame,
-                          sizeof frame, &len) != MXGA_OK)
+    if (mxga_encode_frame(MXGA_PROTOCOL_MINOR, opcode, g_sequence++, payload, payload_len, g_send,
+                          MXGA_MAX_FRAME_BYTES, &len) != MXGA_OK)
         return -1;
     if (fd < 0)
         return 0;
-    return write_all(fd, frame, len);
+    return write_all(fd, g_send, len);
 }
 
 static int send_hello(int fd, uint16_t opcode)
 {
     uint8_t caps[8];
     uint32_t len = 0;
-    if (mxga_encode_capabilities(AGENT_CAPS, caps, sizeof caps, &len) != MXGA_OK)
+    uint64_t mask = mxguest_clip_caps(AGENT_CAPS, g_client.fd >= 0);
+    if (mxga_encode_capabilities(mask, caps, sizeof caps, &len) != MXGA_OK)
         return -1;
     return send_frame(fd, opcode, caps, len);
 }
@@ -274,11 +300,186 @@ static int power_command(int fd, uint16_t opcode, uint64_t sequence)
     return 0;
 }
 
+static int session_listen(void)
+{
+    struct sockaddr_un addr;
+    int fd;
+    if (strlen(SESSION_SOCKET) >= sizeof addr.sun_path)
+        return -1;
+    if (mkdir(SESSION_DIR, 0755) != 0 && errno != EEXIST)
+        return -1;
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return -1;
+    if (fd >= FD_SETSIZE)
+        goto fail;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, SESSION_SOCKET);
+    unlink(SESSION_SOCKET);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || chmod(SESSION_SOCKET, 0666) != 0 ||
+        listen(fd, 4) != 0)
+        goto fail;
+    return fd;
+fail:
+    close(fd);
+    return -1;
+}
+
+static void client_close(void)
+{
+    if (g_client.fd < 0)
+        return;
+    close(g_client.fd);
+    g_client.fd = -1;
+    mxguest_clip_in_free(&g_client.in);
+    mxguest_clip_out_free(&g_client.out);
+}
+
+static int client_drop(int fd)
+{
+    client_close();
+    return send_hello(fd, MXGA_OP_HEARTBEAT);
+}
+
+static int client_flush(void)
+{
+    for (;;) {
+        size_t pending;
+        const uint8_t *data = mxguest_clip_out_pending(&g_client.out, &pending);
+        ssize_t n;
+        if (!pending)
+            return 0;
+        n = send(g_client.fd, data, pending, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+        }
+        if (n == 0)
+            return -1;
+        mxguest_clip_out_advance(&g_client.out, (size_t)n);
+    }
+}
+
+static int client_pending(void)
+{
+    size_t pending = 0;
+    if (g_client.fd >= 0)
+        mxguest_clip_out_pending(&g_client.out, &pending);
+    return pending != 0;
+}
+
+static int client_write_ready(int fd)
+{
+    if (g_client.fd >= 0 && client_flush() != 0)
+        return client_drop(fd);
+    return 0;
+}
+
+static int client_deliver(int fd, const uint8_t *text, uint32_t len)
+{
+    if (g_client.fd < 0)
+        return 0;
+    if (mxguest_clip_out_push(&g_client.out, text, len) != 0 || client_flush() != 0)
+        return client_drop(fd);
+    return 0;
+}
+
+static int client_text(int fd, const uint8_t *text, uint32_t len)
+{
+    uint32_t payload_len = 0;
+    int result = mxguest_clip_build_changed(&g_clip, text, len, g_payload, MXGA_MAX_FRAME_BYTES,
+                                            &payload_len);
+    if (result < 0) {
+        fprintf(stderr, "clipboard text not published\n");
+        return 0;
+    }
+    if (result == 0)
+        return 0;
+    return send_frame(fd, MXGA_OP_CLIPBOARD_CHANGED, g_payload, payload_len);
+}
+
+static int client_read(int fd)
+{
+    uint8_t chunk[16384];
+    size_t used = 0;
+    ssize_t n = recv(g_client.fd, chunk, sizeof chunk, 0);
+    if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+        return client_drop(fd);
+    }
+    if (n == 0)
+        return client_drop(fd);
+    while (used < (size_t)n) {
+        const uint8_t *text;
+        uint32_t len;
+        int state;
+        size_t took = mxguest_clip_in_feed(&g_client.in, chunk + used, (size_t)n - used);
+        used += took;
+        while ((state = mxguest_clip_in_next(&g_client.in, &text, &len)) == 1) {
+            if (client_text(fd, text, len) != 0)
+                return -1;
+        }
+        if (state < 0 || took == 0)
+            return client_drop(fd);
+    }
+    return 0;
+}
+
+static int session_accept(int fd)
+{
+    struct ucred cred;
+    socklen_t cred_len = sizeof cred;
+    struct session_client next = {.fd = -1};
+    int sock = accept4(g_listen, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (sock < 0)
+        return 0;
+    if (sock >= FD_SETSIZE || getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 ||
+        !mxguest_clip_peer_allowed(SEAT_STATE, cred.uid) || mxguest_clip_in_init(&next.in) != 0) {
+        close(sock);
+        return 0;
+    }
+    if (mxguest_clip_out_init(&next.out) != 0) {
+        mxguest_clip_in_free(&next.in);
+        close(sock);
+        return 0;
+    }
+    client_close();
+    next.fd = sock;
+    g_client = next;
+    if (send_hello(fd, MXGA_OP_HEARTBEAT) != 0)
+        return -1;
+    if (g_clip.have_host)
+        return client_deliver(fd, g_clip.host_text, g_clip.host_len);
+    return 0;
+}
+
+static int host_clipboard(int fd, const uint8_t *payload, uint32_t len)
+{
+    const uint8_t *text;
+    uint32_t text_len;
+    int result;
+    if (!g_clip_ready)
+        return 0;
+    result = mxguest_clip_host_write(&g_clip, payload, len, &text, &text_len);
+    if (result < 0) {
+        fprintf(stderr, "clipboard write ignored\n");
+        return 0;
+    }
+    if (result == 0)
+        return 0;
+    return client_deliver(fd, text, text_len);
+}
+
 static int handle_frame(int fd, const uint8_t *buf, uint32_t len)
 {
     struct mxga_frame frame;
     if (mxga_decode_frame(buf, len, &frame) != MXGA_OK)
         return -1;
+    if (frame.opcode == MXGA_OP_CLIPBOARD_WRITE)
+        return host_clipboard(fd, frame.payload, frame.payload_len);
     if (frame.opcode == MXGA_OP_SHUTDOWN)
         return frame.payload_len ? -1 : power_command(fd, MXGA_OP_SHUTDOWN, frame.sequence);
     if (frame.opcode == MXGA_OP_RESTART)
@@ -343,10 +544,27 @@ static int report_clock(uint64_t *milliseconds)
 int main(int argc, char **argv)
 {
     int fd;
-    uint64_t now, next_report;
+    uint64_t now, next_report, origin;
+    uint8_t *buf;
     int check = argc > 1 && strcmp(argv[1], "--check") == 0;
     if (check)
         return self_check();
+    buf = malloc(MXGA_MAX_FRAME_BYTES);
+    g_payload = malloc(MXGA_MAX_FRAME_BYTES);
+    if (!buf || !g_payload) {
+        fprintf(stderr, "buffer allocation failed\n");
+        return 1;
+    }
+    origin = mxguest_clip_random_origin();
+    if (origin && mxguest_clip_init(&g_clip, origin) == 0) {
+        g_listen = session_listen();
+        if (g_listen >= 0)
+            g_clip_ready = 1;
+        else
+            mxguest_clip_free(&g_clip);
+    }
+    if (!g_clip_ready)
+        fprintf(stderr, "clipboard sharing unavailable\n");
     fd = open(AGENT_DEVICE, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "open %s failed errno %d\n", AGENT_DEVICE, errno);
@@ -365,25 +583,36 @@ int main(int argc, char **argv)
         return 1;
     next_report = now + 5000u;
     for (;;) {
-        uint8_t buf[4096];
         ssize_t n;
-        fd_set read_set;
+        fd_set read_set, write_set;
         struct timeval wait;
         uint64_t remaining;
+        int maxfd = fd;
         if (report_clock(&now) != 0)
             return 1;
         remaining = next_report > now ? next_report - now : 0;
         FD_ZERO(&read_set);
+        FD_ZERO(&write_set);
         FD_SET(fd, &read_set);
+        if (g_listen >= 0) {
+            FD_SET(g_listen, &read_set);
+            maxfd = g_listen > maxfd ? g_listen : maxfd;
+        }
+        if (g_client.fd >= 0) {
+            FD_SET(g_client.fd, &read_set);
+            if (client_pending())
+                FD_SET(g_client.fd, &write_set);
+            maxfd = g_client.fd > maxfd ? g_client.fd : maxfd;
+        }
         wait.tv_sec = remaining / 1000u;
         wait.tv_usec = (remaining % 1000u) * 1000u;
-        if (select(fd + 1, &read_set, NULL, NULL, &wait) < 0) {
+        if (select(maxfd + 1, &read_set, &write_set, NULL, &wait) < 0) {
             if (errno == EINTR)
                 continue;
             return 1;
         }
         if (FD_ISSET(fd, &read_set)) {
-            n = read(fd, buf, sizeof buf);
+            n = read(fd, buf, MXGA_MAX_FRAME_BYTES);
             if (n < 0) {
                 if (errno == EINTR)
                     continue;
@@ -392,6 +621,12 @@ int main(int argc, char **argv)
             if (n == 0 || handle_frame(fd, buf, (uint32_t)n) != 0)
                 return 1;
         }
+        if (g_listen >= 0 && FD_ISSET(g_listen, &read_set) && session_accept(fd) != 0)
+            return 1;
+        if (g_client.fd >= 0 && FD_ISSET(g_client.fd, &write_set) && client_write_ready(fd) != 0)
+            return 1;
+        if (g_client.fd >= 0 && FD_ISSET(g_client.fd, &read_set) && client_read(fd) != 0)
+            return 1;
         if (report_clock(&now) != 0)
             return 1;
         if (now >= next_report) {

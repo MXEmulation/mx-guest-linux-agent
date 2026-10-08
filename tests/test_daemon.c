@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* SPDX-FileCopyrightText: 2026 Zak Noble-Clarke */
+#define SESSION_DIR "build/test-agent"
+#define SEAT_STATE "build/test-agent/seat0"
 #define main mxguest_daemon_main
 #include "../src/mxguest_agentd.c"
 #undef main

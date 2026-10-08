@@ -3,7 +3,7 @@
 
 The Linux MX guest-agent daemon, GNOME session bridge and source installer.
 
-`mxguest-agentd` sends HELLO, HEARTBEAT and system statistics and handles shutdown and restart requests. Power results report the actual bounded system-manager invocation and preserve the request sequence. The daemon advertises only implemented capabilities. Clipboard, shared folders, local-client routing and host application-window content routing are not implemented.
+`mxguest-agentd` sends HELLO, HEARTBEAT and system statistics and handles shutdown and restart requests. Power results report the actual bounded system-manager invocation and preserve the request sequence. The daemon advertises only implemented capabilities. Clipboard sharing is routed through a local stream socket at `/run/mxguest-agent/session.sock`, which accepts one client at a time: root, or the active seat user from `ACTIVE_UID=` in `/run/systemd/seats/seat0`. Messages in both directions are a 4-byte little-endian length followed by UTF-8 text. The clipboard capabilities are advertised only while a client is connected, the latest host write is delivered when a client connects unless the guest has published newer text, and text the host wrote is not published back. Shared folders, other local-client routing and host application-window content routing are not implemented.
 
 The [GNOME session bridge](session-bridge/README.md) provides local window inventory, activation and closing, installed application discovery and launch. It does not supply the content or daemon route required for host integration.
 
