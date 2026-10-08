@@ -7,6 +7,7 @@ import {BUS_NAME, OBJECT_PATH, XML} from './api.js';
 import {DBusAPI} from './service.js';
 import {Backend} from './backend.js';
 import {Applications, Inventory} from './model.js';
+import {ClipboardBridge} from './clipboard.js';
 
 export default class SessionBridge extends Extension {
     enable() {
@@ -52,6 +53,7 @@ export default class SessionBridge extends Extension {
         this._syncWindows();
         this._inventory.refresh();
         this._applications.refresh();
+        this._clipboard = new ClipboardBridge();
     }
 
     _connect(object, signal, callback) {
@@ -94,6 +96,8 @@ export default class SessionBridge extends Extension {
     }
 
     disable() {
+        this._clipboard?.destroy();
+        this._clipboard = null;
         if (this._source)
             GLib.source_remove(this._source);
         this._source = 0;

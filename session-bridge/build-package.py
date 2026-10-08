@@ -38,7 +38,7 @@ def main():
     package = args.output / metadata["uuid"]
     package.mkdir(exist_ok=True)
     names = ["extension.js", "backend.js", "files.js", "sysfs.js", "model.js", "api.js", "service.js",
-             "metadata.json", "README.md", "DEPENDENCIES.md"]
+             "clipboard.js", "clipboard-protocol.js", "metadata.json", "README.md", "DEPENDENCIES.md"]
     for name in names:
         shutil.copyfile(source / name, package / name)
     (package / "identity.js").write_text(

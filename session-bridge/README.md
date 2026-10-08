@@ -25,6 +25,10 @@ The catalogue filters hidden and desktop-excluded entries, reports actual icon d
 
 `WindowInventoryChanged(session, generation)` and `ApplicationCatalogueChanged(session, generation)` notify clients to refresh. Window notifications are coalesced through one idle source without frame or pointer polling. Direct list and action calls refresh immediately.
 
+## Clipboard
+
+The extension relays the desktop text clipboard with the guest-agent daemon over the Unix stream socket `/run/mxguest-agent/session.sock`. Each message is a 4-byte little-endian length followed by that many bytes of UTF-8 text, at most 1048536; a zero length is an empty clipboard. The bridge sends the clipboard text when the compositor reports a new owner (bursts coalesced, texts the bridge itself applied are not echoed) and once after each connection, and sets the clipboard when the daemon sends text. Only text is relayed. Connection and I/O are asynchronous; a failed or closed connection is retried with a delay growing from 1 s to 30 s. The daemon keeps a single client, so a newer connection replaces an older one.
+
 ## Build and checks
 
 From the agent repository:
