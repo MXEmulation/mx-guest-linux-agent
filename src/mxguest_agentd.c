@@ -2,8 +2,10 @@
 /* SPDX-FileCopyrightText: 2026 Zak Noble-Clarke */
 #define _GNU_SOURCE
 #include "clipboard.h"
+#include "integration.h"
 #include "mxga.h"
 #include "power.h"
+#include "session.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -29,10 +31,14 @@
 #define SEAT_STATE "/run/systemd/seats/seat0"
 #endif
 
+#ifndef PCI_DEVICES
+#define PCI_DEVICES "/sys/bus/pci/devices"
+#endif
+
 struct session_client {
     int fd;
-    struct mxguest_clip_in in;
-    struct mxguest_clip_out out;
+    struct mxguest_session_in in;
+    struct mxguest_session_out out;
 };
 
 static uint64_t g_sequence = 1;
@@ -40,6 +46,8 @@ static uint8_t *g_send;
 static uint8_t *g_payload;
 static struct mxguest_clip g_clip;
 static int g_clip_ready;
+static struct mxguest_integration g_integration;
+static int g_integration_ready;
 static int g_listen = -1;
 static struct session_client g_client = {.fd = -1};
 
@@ -81,7 +89,9 @@ static int send_hello(int fd, uint16_t opcode)
 {
     uint8_t caps[8];
     uint32_t len = 0;
-    uint64_t mask = mxguest_clip_caps(AGENT_CAPS, g_client.fd >= 0);
+    int connected = g_client.fd >= 0;
+    uint64_t mask = mxguest_clip_caps(AGENT_CAPS, connected && g_clip_ready);
+    mask = mxguest_integration_caps(mask, connected && g_integration_ready);
     if (mxga_encode_capabilities(mask, caps, sizeof caps, &len) != MXGA_OK)
         return -1;
     return send_frame(fd, opcode, caps, len);
@@ -332,8 +342,10 @@ static void client_close(void)
         return;
     close(g_client.fd);
     g_client.fd = -1;
-    mxguest_clip_in_free(&g_client.in);
-    mxguest_clip_out_free(&g_client.out);
+    mxguest_session_in_free(&g_client.in);
+    mxguest_session_out_free(&g_client.out);
+    if (g_integration_ready)
+        mxguest_integration_reset(&g_integration);
 }
 
 static int client_drop(int fd)
@@ -346,7 +358,7 @@ static int client_flush(void)
 {
     for (;;) {
         size_t pending;
-        const uint8_t *data = mxguest_clip_out_pending(&g_client.out, &pending);
+        const uint8_t *data = mxguest_session_out_pending(&g_client.out, &pending);
         ssize_t n;
         if (!pending)
             return 0;
@@ -358,7 +370,7 @@ static int client_flush(void)
         }
         if (n == 0)
             return -1;
-        mxguest_clip_out_advance(&g_client.out, (size_t)n);
+        mxguest_session_out_advance(&g_client.out, (size_t)n);
     }
 }
 
@@ -366,7 +378,7 @@ static int client_pending(void)
 {
     size_t pending = 0;
     if (g_client.fd >= 0)
-        mxguest_clip_out_pending(&g_client.out, &pending);
+        mxguest_session_out_pending(&g_client.out, &pending);
     return pending != 0;
 }
 
@@ -377,20 +389,60 @@ static int client_write_ready(int fd)
     return 0;
 }
 
-static int client_deliver(int fd, const uint8_t *text, uint32_t len)
+static int client_deliver(int fd, uint8_t type, const uint8_t *payload, uint32_t len)
 {
     if (g_client.fd < 0)
         return 0;
-    if (mxguest_clip_out_push(&g_client.out, text, len) != 0 || client_flush() != 0)
+    if (mxguest_session_out_push(&g_client.out, type, payload, len) != 0 || client_flush() != 0)
         return client_drop(fd);
     return 0;
+}
+
+static int send_status(int fd)
+{
+    uint16_t flags = mxguest_integration_system_flags(PCI_DEVICES);
+    uint32_t len = 0;
+    int built = mxguest_integration_build(&g_integration, flags, g_payload, MXGA_MAX_FRAME_BYTES,
+                                          &len);
+    if (built < 0) {
+        fprintf(stderr, "window inventory not published\n");
+        return 0;
+    }
+    if (built == 0)
+        return 0;
+    if (send_frame(fd, MXGA_OP_INTEGRATION_STATUS, g_payload, len) != 0)
+        return -1;
+    mxguest_integration_mark_sent(&g_integration, flags);
+    return 0;
+}
+
+static int refresh_status(int fd)
+{
+    if (g_client.fd < 0 || !g_integration_ready ||
+        !mxguest_integration_due(&g_integration, mxguest_integration_system_flags(PCI_DEVICES)))
+        return 0;
+    return send_status(fd);
+}
+
+static int client_windows(int fd, const uint8_t *payload, uint32_t len)
+{
+    if (!g_integration_ready)
+        return 0;
+    if (mxguest_integration_accept(&g_integration, payload, len) != 0) {
+        fprintf(stderr, "window inventory rejected\n");
+        return client_drop(fd);
+    }
+    return send_status(fd);
 }
 
 static int client_text(int fd, const uint8_t *text, uint32_t len)
 {
     uint32_t payload_len = 0;
-    int result = mxguest_clip_build_changed(&g_clip, text, len, g_payload, MXGA_MAX_FRAME_BYTES,
-                                            &payload_len);
+    int result;
+    if (!g_clip_ready)
+        return 0;
+    result = mxguest_clip_build_changed(&g_clip, text, len, g_payload, MXGA_MAX_FRAME_BYTES,
+                                        &payload_len);
     if (result < 0) {
         fprintf(stderr, "clipboard text not published\n");
         return 0;
@@ -413,14 +465,19 @@ static int client_read(int fd)
     if (n == 0)
         return client_drop(fd);
     while (used < (size_t)n) {
-        const uint8_t *text;
+        const uint8_t *payload;
+        uint8_t type;
         uint32_t len;
         int state;
-        size_t took = mxguest_clip_in_feed(&g_client.in, chunk + used, (size_t)n - used);
+        size_t took = mxguest_session_in_feed(&g_client.in, chunk + used, (size_t)n - used);
         used += took;
-        while ((state = mxguest_clip_in_next(&g_client.in, &text, &len)) == 1) {
-            if (client_text(fd, text, len) != 0)
+        while ((state = mxguest_session_in_next(&g_client.in, &type, &payload, &len)) == 1) {
+            int failed = type == MXGUEST_SESSION_CLIPBOARD ? client_text(fd, payload, len)
+                                                           : client_windows(fd, payload, len);
+            if (failed)
                 return -1;
+            if (g_client.fd < 0)
+                return 0;
         }
         if (state < 0 || took == 0)
             return client_drop(fd);
@@ -437,12 +494,12 @@ static int session_accept(int fd)
     if (sock < 0)
         return 0;
     if (sock >= FD_SETSIZE || getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 ||
-        !mxguest_clip_peer_allowed(SEAT_STATE, cred.uid) || mxguest_clip_in_init(&next.in) != 0) {
+        !mxguest_clip_peer_allowed(SEAT_STATE, cred.uid) || mxguest_session_in_init(&next.in) != 0) {
         close(sock);
         return 0;
     }
-    if (mxguest_clip_out_init(&next.out) != 0) {
-        mxguest_clip_in_free(&next.in);
+    if (mxguest_session_out_init(&next.out) != 0) {
+        mxguest_session_in_free(&next.in);
         close(sock);
         return 0;
     }
@@ -451,8 +508,8 @@ static int session_accept(int fd)
     g_client = next;
     if (send_hello(fd, MXGA_OP_HEARTBEAT) != 0)
         return -1;
-    if (g_clip.have_host)
-        return client_deliver(fd, g_clip.host_text, g_clip.host_len);
+    if (g_clip_ready && g_clip.have_host)
+        return client_deliver(fd, MXGUEST_SESSION_CLIPBOARD, g_clip.host_text, g_clip.host_len);
     return 0;
 }
 
@@ -470,7 +527,22 @@ static int host_clipboard(int fd, const uint8_t *payload, uint32_t len)
     }
     if (result == 0)
         return 0;
-    return client_deliver(fd, text, text_len);
+    return client_deliver(fd, MXGUEST_SESSION_CLIPBOARD, text, text_len);
+}
+
+static int host_action(int fd, const uint8_t *payload, uint32_t len)
+{
+    int result;
+    if (!g_integration_ready || g_client.fd < 0)
+        return 0;
+    result = mxguest_integration_forward(&g_integration, &g_client.out, payload, len);
+    if (result == -1)
+        fprintf(stderr, "window action ignored\n");
+    if (result == -2)
+        return client_drop(fd);
+    if (result == 1 && client_flush() != 0)
+        return client_drop(fd);
+    return 0;
 }
 
 static int handle_frame(int fd, const uint8_t *buf, uint32_t len)
@@ -480,6 +552,8 @@ static int handle_frame(int fd, const uint8_t *buf, uint32_t len)
         return -1;
     if (frame.opcode == MXGA_OP_CLIPBOARD_WRITE)
         return host_clipboard(fd, frame.payload, frame.payload_len);
+    if (frame.opcode == MXGA_OP_INTEGRATION_WINDOW_ACTION)
+        return host_action(fd, frame.payload, frame.payload_len);
     if (frame.opcode == MXGA_OP_SHUTDOWN)
         return frame.payload_len ? -1 : power_command(fd, MXGA_OP_SHUTDOWN, frame.sequence);
     if (frame.opcode == MXGA_OP_RESTART)
@@ -556,15 +630,22 @@ int main(int argc, char **argv)
         return 1;
     }
     origin = mxguest_clip_random_origin();
-    if (origin && mxguest_clip_init(&g_clip, origin) == 0) {
+    g_clip_ready = origin && mxguest_clip_init(&g_clip, origin) == 0;
+    g_integration_ready = mxguest_integration_init(&g_integration) == 0;
+    if (g_clip_ready || g_integration_ready)
         g_listen = session_listen();
-        if (g_listen >= 0)
-            g_clip_ready = 1;
-        else
+    if (g_listen < 0) {
+        if (g_clip_ready)
             mxguest_clip_free(&g_clip);
+        if (g_integration_ready)
+            mxguest_integration_free(&g_integration);
+        g_clip_ready = 0;
+        g_integration_ready = 0;
     }
     if (!g_clip_ready)
         fprintf(stderr, "clipboard sharing unavailable\n");
+    if (!g_integration_ready)
+        fprintf(stderr, "window integration unavailable\n");
     fd = open(AGENT_DEVICE, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "open %s failed errno %d\n", AGENT_DEVICE, errno);
@@ -630,7 +711,8 @@ int main(int argc, char **argv)
         if (report_clock(&now) != 0)
             return 1;
         if (now >= next_report) {
-            if (send_hello(fd, MXGA_OP_HEARTBEAT) != 0 || send_stats(fd) != 0)
+            if (send_hello(fd, MXGA_OP_HEARTBEAT) != 0 || send_stats(fd) != 0 ||
+                refresh_status(fd) != 0)
                 return 1;
             next_report = now + 5000u;
         }

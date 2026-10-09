@@ -11,6 +11,11 @@ export class Inventory {
         this._generation = 0;
         this._serialized = null;
         this._handles = new Map();
+        this._last = null;
+    }
+
+    last() {
+        return this._last;
     }
 
     _id(handle) {
@@ -35,20 +40,21 @@ export class Inventory {
         const body = {...observed, windows};
         const serialized = JSON.stringify(body);
         this._handles = handles;
+        let advanced = false;
         if (serialized !== this._serialized) {
             if (!Number.isSafeInteger(this._generation + 1))
                 throw new Error('Inventory generation space exhausted');
             this._serialized = serialized;
             this._generation++;
-            this.changed(this.sessionId, String(this._generation));
+            advanced = true;
         }
-        return {session_id: this.sessionId, generation: String(this._generation), ...body};
+        this._last = {session_id: this.sessionId, generation: String(this._generation), ...body};
+        if (advanced)
+            this.changed(this.sessionId, String(this._generation));
+        return this._last;
     }
 
-    control(action, sessionId, generation, id) {
-        const current = this.refresh();
-        if (sessionId !== this.sessionId || generation !== current.generation)
-            throw new Error('Stale session or window inventory generation');
+    _perform(action, id) {
         const handle = this._handles.get(id);
         if (!handle)
             throw new Error('Window no longer exists');
@@ -58,6 +64,20 @@ export class Inventory {
             this.backend.close(handle);
         else
             throw new Error('Unsupported window action');
+    }
+
+    control(action, sessionId, generation, id) {
+        const current = this.refresh();
+        if (sessionId !== this.sessionId || generation !== current.generation)
+            throw new Error('Stale session or window inventory generation');
+        this._perform(action, id);
+        return {accepted: true, session_id: this.sessionId, generation: current.generation, window_id: id};
+    }
+
+    // Acts on a window of this session by identity alone, for callers that validated their own generation.
+    act(action, id) {
+        const current = this.refresh();
+        this._perform(action, id);
         return {accepted: true, session_id: this.sessionId, generation: current.generation, window_id: id};
     }
 }

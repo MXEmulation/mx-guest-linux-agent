@@ -32,7 +32,8 @@ const backend = {
     launch(app) { this.actions.push(['launch', app]); },
 };
 const signals = [];
-const inventory = new Inventory('session-a', backend, (...args) => signals.push(args));
+const inventory = new Inventory('session-a', backend, (...args) => signals.push([...args, inventory.last()?.generation]));
+assert(inventory.last() === null, 'Snapshot present before the first refresh');
 const applications = new Applications('session-a', backend);
 const api = new API(inventory, applications);
 const original = JSON.parse(api.ListWindows());
@@ -41,6 +42,7 @@ assert(original.windows[0].frame.x === -40, 'No invented scanout geometry');
 assert(!('handle' in original.windows[0]), 'Private native handle leaked');
 assert(JSON.parse(api.ListWindows()).generation === original.generation, 'Stable generation');
 assert(signals.length === 1, 'Unchanged inventory emitted a change');
+assert(signals[0][2] === '1' && inventory.last().windows.length === 2, 'Snapshot not current when the change was announced');
 api.Activate('session-a', '1', original.windows[0].id);
 api.Close('session-a', '1', original.windows[1].id);
 assert(backend.actions[0][1] === first && backend.actions[1][1] === second, 'Wrong native target');
@@ -55,6 +57,11 @@ rejects(() => api.Close('session-a', removed.generation, original.windows[0].id)
 backend.observed.push({handle: replacement, title: 'New window', client_type: 'wayland'});
 const added = JSON.parse(api.ListWindows());
 assert(added.windows[1].id !== original.windows[0].id, 'Reused retired window identity');
+assert(inventory.last().generation === added.generation, 'Snapshot is not the latest refresh');
+inventory.act('activate', added.windows[0].id);
+assert(backend.actions.at(-1)[0] === 'activate' && backend.actions.at(-1)[1] === second, 'Identity-only action missed its target');
+rejects(() => inventory.act('close', 'missing'), 'Identity-only action accepted an unknown window');
+rejects(() => inventory.act('minimise', added.windows[0].id), 'Identity-only action accepted an unknown action');
 const catalogue = JSON.parse(api.ListApplications());
 api.Launch('session-a', catalogue.generation, 'one.desktop');
 assert(backend.actions.at(-1)[0] === 'launch', 'Launch was not dispatched');

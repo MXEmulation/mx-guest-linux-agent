@@ -8,6 +8,9 @@ import {DBusAPI} from './service.js';
 import {Backend} from './backend.js';
 import {Applications, Inventory} from './model.js';
 import {ClipboardBridge} from './clipboard.js';
+import {IconResolver} from './icons.js';
+import {IntegrationBridge} from './integration.js';
+import {SessionLink} from './session-link.js';
 
 export default class SessionBridge extends Extension {
     enable() {
@@ -25,8 +28,10 @@ export default class SessionBridge extends Extension {
         this._source = 0;
         this._backend = new Backend(global);
         const session = GLib.uuid_string_random();
-        this._inventory = new Inventory(session, this._backend, (id, generation) =>
-            this._object?.emit_signal('WindowInventoryChanged', new GLib.Variant('(ss)', [id, generation])));
+        this._inventory = new Inventory(session, this._backend, (id, generation) => {
+            this._object?.emit_signal('WindowInventoryChanged', new GLib.Variant('(ss)', [id, generation]));
+            this._integration?.changed();
+        });
         this._applications = new Applications(session, this._backend, (id, generation) =>
             this._object?.emit_signal('ApplicationCatalogueChanged', new GLib.Variant('(ss)', [id, generation])));
         this._object = Gio.DBusExportedObject.wrapJSObject(XML,
@@ -53,7 +58,11 @@ export default class SessionBridge extends Extension {
         this._syncWindows();
         this._inventory.refresh();
         this._applications.refresh();
-        this._clipboard = new ClipboardBridge();
+        this._link = new SessionLink();
+        this._icons = new IconResolver(() => this._integration?.changed());
+        this._integration = new IntegrationBridge(this._link, this._inventory, this._icons);
+        this._clipboard = new ClipboardBridge(this._link);
+        this._link.start();
     }
 
     _connect(object, signal, callback) {
@@ -98,6 +107,12 @@ export default class SessionBridge extends Extension {
     disable() {
         this._clipboard?.destroy();
         this._clipboard = null;
+        this._integration?.destroy();
+        this._integration = null;
+        this._icons?.destroy();
+        this._icons = null;
+        this._link?.destroy();
+        this._link = null;
         if (this._source)
             GLib.source_remove(this._source);
         this._source = 0;

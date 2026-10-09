@@ -92,7 +92,8 @@ export class Backend {
                 showing_on_workspace: window.showing_on_its_workspace(), fullscreen: window.is_fullscreen(),
                 mapped: window.mapped, can_close: window.can_close()};
         });
-        return {coordinate_space: 'mutter-stage', monitors, windows};
+        return {coordinate_space: 'mutter-stage', active_workspace: this.global.workspace_manager.get_active_workspace_index(),
+            monitors, windows};
     }
 
     activate(window) {
