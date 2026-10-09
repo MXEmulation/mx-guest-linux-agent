@@ -4,12 +4,16 @@
 #include "clipboard.h"
 #include "integration.h"
 #include "mxga.h"
+#include "network.h"
 #include "power.h"
 #include "session.h"
+#include "share.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +38,8 @@
 #ifndef PCI_DEVICES
 #define PCI_DEVICES "/sys/bus/pci/devices"
 #endif
+#define MOUNTINFO "/proc/self/mountinfo"
+#define OWNER_REFRESH_MS 2000u
 
 struct session_client {
     int fd;
@@ -50,6 +56,13 @@ static struct mxguest_integration g_integration;
 static int g_integration_ready;
 static int g_listen = -1;
 static struct session_client g_client = {.fd = -1};
+static int g_device = -1;
+static int g_network_ready;
+static uint8_t g_network_last[MXGUEST_NETWORK_PAYLOAD_MAX];
+static uint32_t g_network_last_len;
+static int g_network_sent;
+static struct mxguest_shares *g_shares;
+static int g_stop[2] = {-1, -1};
 
 static int write_all(int fd, const uint8_t *buf, uint32_t len)
 {
@@ -92,6 +105,10 @@ static int send_hello(int fd, uint16_t opcode)
     int connected = g_client.fd >= 0;
     uint64_t mask = mxguest_clip_caps(AGENT_CAPS, connected && g_clip_ready);
     mask = mxguest_integration_caps(mask, connected && g_integration_ready);
+    if (g_network_ready)
+        mask |= MXGA_CAP_NETWORK_INFO;
+    if (g_shares)
+        mask |= MXGA_CAP_FOLDER_SHARING;
     if (mxga_encode_capabilities(mask, caps, sizeof caps, &len) != MXGA_OK)
         return -1;
     return send_frame(fd, opcode, caps, len);
@@ -284,6 +301,43 @@ static int send_stats(int fd)
     if (mxga_encode_system_stats(&stats, payload, sizeof payload, &len) != MXGA_OK)
         return -1;
     return send_frame(fd, MXGA_OP_SYSTEM_STATS, payload, len);
+}
+
+static int send_network(int fd, int force)
+{
+    uint32_t len = 0;
+    if (!g_network_ready)
+        return 0;
+    if (mxguest_network_collect(g_payload, MXGUEST_NETWORK_PAYLOAD_MAX, &len) != 0) {
+        fprintf(stderr, "network inventory not collected\n");
+        return 0;
+    }
+    if (!force && g_network_sent && len == g_network_last_len &&
+        !memcmp(g_network_last, g_payload, len))
+        return 0;
+    if (send_frame(fd, MXGA_OP_NETWORK_INFO, g_payload, len) != 0) {
+        if (errno != EINVAL)
+            return -1;
+        fprintf(stderr, "transport refuses network inventory; capability withdrawn\n");
+        g_network_ready = 0;
+        return send_hello(fd, MXGA_OP_HEARTBEAT);
+    }
+    memcpy(g_network_last, g_payload, len);
+    g_network_last_len = len;
+    g_network_sent = 1;
+    return 0;
+}
+
+static int shares_result(int fd, int result)
+{
+    if (!result)
+        return 0;
+    if (errno != EINVAL)
+        return -1;
+    fprintf(stderr, "transport refuses shared folder frames; capability withdrawn\n");
+    mxguest_shares_free(g_shares);
+    g_shares = NULL;
+    return send_hello(fd, MXGA_OP_HEARTBEAT);
 }
 
 static int power_command(int fd, uint16_t opcode, uint64_t sequence)
@@ -545,11 +599,33 @@ static int host_action(int fd, const uint8_t *payload, uint32_t len)
     return 0;
 }
 
+static int report_clock(uint64_t *milliseconds);
+
+static int host_share(int fd, const struct mxga_frame *frame)
+{
+    uint64_t now = 0;
+    int result;
+    if (!g_shares)
+        return 0;
+    if (frame->opcode == MXGA_OP_MOUNT_SHARE)
+        result = mxguest_shares_mount(g_shares, frame->payload, frame->payload_len);
+    else if (frame->opcode == MXGA_OP_UNMOUNT_SHARE)
+        result = mxguest_shares_unmount(g_shares, frame->payload, frame->payload_len);
+    else
+        result = report_clock(&now) != 0
+                     ? -1
+                     : mxguest_shares_response(g_shares, frame->payload, frame->payload_len, now);
+    return shares_result(fd, result);
+}
+
 static int handle_frame(int fd, const uint8_t *buf, uint32_t len)
 {
     struct mxga_frame frame;
     if (mxga_decode_frame(buf, len, &frame) != MXGA_OK)
         return -1;
+    if (frame.opcode == MXGA_OP_MOUNT_SHARE || frame.opcode == MXGA_OP_UNMOUNT_SHARE ||
+        frame.opcode == MXGA_OP_FS_RESPONSE)
+        return host_share(fd, &frame);
     if (frame.opcode == MXGA_OP_CLIPBOARD_WRITE)
         return host_clipboard(fd, frame.payload, frame.payload_len);
     if (frame.opcode == MXGA_OP_INTEGRATION_WINDOW_ACTION)
@@ -575,6 +651,9 @@ static int self_check(void)
     uint32_t frame_len = 0;
     uint64_t capabilities = 0;
     struct mxga_frame decoded;
+    static struct mxga_network_interface interfaces[MXGA_NETWORK_MAX_INTERFACES];
+    static struct mxga_network_address addresses[MXGA_NETWORK_MAX_INTERFACES * 4u];
+    uint32_t interface_count = 0;
     if (collect_stats(&stats, cpus, 8, &used) != 0 || used == 0)
         return 1;
     if (mxga_encode_system_stats(&stats, payload, sizeof payload, &len) != MXGA_OK)
@@ -601,8 +680,15 @@ static int self_check(void)
         return 1;
     if ((capabilities & AGENT_CAPS) != AGENT_CAPS)
         return 1;
-    printf("agent frames ok cpus %u mem %llu\n", got.cpu_count,
-           (unsigned long long)got.memory_total_bytes);
+    if (!g_payload && !(g_payload = malloc(MXGUEST_NETWORK_PAYLOAD_MAX)))
+        return 1;
+    if (mxguest_network_collect(g_payload, MXGUEST_NETWORK_PAYLOAD_MAX, &len) != 0 ||
+        mxga_decode_network_info(g_payload, len, interfaces, MXGA_NETWORK_MAX_INTERFACES,
+                                 addresses, MXGA_NETWORK_MAX_INTERFACES * 4u,
+                                 &interface_count) != MXGA_OK)
+        return 1;
+    printf("agent frames ok cpus %u mem %llu interfaces %u\n", got.cpu_count,
+           (unsigned long long)got.memory_total_bytes, interface_count);
     return 0;
 }
 
@@ -615,10 +701,82 @@ static int report_clock(uint64_t *milliseconds)
     return 0;
 }
 
+static int share_send(void *ctx, uint16_t opcode, const uint8_t *payload, uint32_t len)
+{
+    (void)ctx;
+    return send_frame(g_device, opcode, payload, len);
+}
+
+static void share_owner(void *ctx, uint32_t *uid, uint32_t *gid)
+{
+    static uint64_t checked;
+    static uint32_t owner_uid, owner_gid;
+    static int have;
+    uint64_t now = 0;
+    (void)ctx;
+    if (report_clock(&now) != 0 || !have || now - checked >= OWNER_REFRESH_MS) {
+        uid_t active;
+        owner_uid = 0;
+        owner_gid = 0;
+        if (mxguest_clip_active_uid(SEAT_STATE, &active) == 0) {
+            struct passwd entry, *found = NULL;
+            char text[2048];
+            owner_uid = (uint32_t)active;
+            if (getpwuid_r(active, &entry, text, sizeof text, &found) == 0 && found)
+                owner_gid = (uint32_t)entry.pw_gid;
+        }
+        checked = now;
+        have = 1;
+    }
+    *uid = owner_uid;
+    *gid = owner_gid;
+}
+
+static void stop_signal(int signal_number)
+{
+    int saved = errno;
+    uint8_t byte = (uint8_t)signal_number;
+    ssize_t written = write(g_stop[1], &byte, 1);
+    (void)written;
+    errno = saved;
+}
+
+static int stop_install(void)
+{
+    struct sigaction action;
+    int signals[] = {SIGTERM, SIGINT, SIGHUP};
+    unsigned i;
+    if (pipe2(g_stop, O_CLOEXEC | O_NONBLOCK) != 0 || g_stop[0] >= FD_SETSIZE)
+        return -1;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = stop_signal;
+    sigemptyset(&action.sa_mask);
+    for (i = 0; i < sizeof signals / sizeof signals[0]; i++)
+        if (sigaction(signals[i], &action, NULL) != 0)
+            return -1;
+    return 0;
+}
+
+static void shares_start(void)
+{
+    static const struct mxguest_share_system system = {
+        NULL, mxguest_share_attach, mxguest_share_detach, share_owner, share_send};
+    if (!mxguest_share_available()) {
+        fprintf(stderr, "shared folders unavailable\n");
+        return;
+    }
+    mxguest_share_sweep(MOUNTINFO);
+    g_shares = mxguest_shares_new(&system);
+    if (!g_shares)
+        fprintf(stderr, "shared folders unavailable\n");
+}
+
+static int agent_loop(int fd, uint8_t *buf);
+
 int main(int argc, char **argv)
 {
-    int fd;
-    uint64_t now, next_report, origin;
+    int fd, status;
+    uint64_t origin;
     uint8_t *buf;
     int check = argc > 1 && strcmp(argv[1], "--check") == 0;
     if (check)
@@ -656,7 +814,28 @@ int main(int argc, char **argv)
         close(fd);
         return 1;
     }
-    if (send_hello(fd, MXGA_OP_HELLO) != 0 || send_stats(fd) != 0) {
+    g_device = fd;
+    if (stop_install() != 0) {
+        fprintf(stderr, "signal handling unavailable\n");
+        return 1;
+    }
+    g_network_ready = 1;
+    shares_start();
+    status = agent_loop(fd, buf);
+    if (g_shares) {
+        if (mxguest_shares_close(g_shares) != 0)
+            fprintf(stderr, "shared folder shutdown not reported\n");
+        mxguest_shares_free(g_shares);
+        g_shares = NULL;
+    }
+    return status;
+}
+
+static int agent_loop(int fd, uint8_t *buf)
+{
+    uint64_t now, next_report;
+    if (send_hello(fd, MXGA_OP_HELLO) != 0 || send_stats(fd) != 0 || send_network(fd, 1) != 0 ||
+        (g_shares && shares_result(fd, mxguest_shares_publish(g_shares)) != 0)) {
         fprintf(stderr, "hello failed errno %d\n", errno);
         return 1;
     }
@@ -667,14 +846,20 @@ int main(int argc, char **argv)
         ssize_t n;
         fd_set read_set, write_set;
         struct timeval wait;
-        uint64_t remaining;
-        int maxfd = fd;
+        uint64_t remaining, deadline;
+        int maxfd = fd > g_stop[0] ? fd : g_stop[0];
         if (report_clock(&now) != 0)
             return 1;
         remaining = next_report > now ? next_report - now : 0;
+        deadline = g_shares ? mxguest_shares_deadline(g_shares) : UINT64_MAX;
+        if (deadline != UINT64_MAX && deadline - now < remaining)
+            remaining = deadline > now ? deadline - now : 0;
         FD_ZERO(&read_set);
         FD_ZERO(&write_set);
         FD_SET(fd, &read_set);
+        FD_SET(g_stop[0], &read_set);
+        if (g_shares)
+            maxfd = mxguest_shares_watch(g_shares, &read_set, maxfd);
         if (g_listen >= 0) {
             FD_SET(g_listen, &read_set);
             maxfd = g_listen > maxfd ? g_listen : maxfd;
@@ -692,6 +877,8 @@ int main(int argc, char **argv)
                 continue;
             return 1;
         }
+        if (FD_ISSET(g_stop[0], &read_set))
+            return 0;
         if (FD_ISSET(fd, &read_set)) {
             n = read(fd, buf, MXGA_MAX_FRAME_BYTES);
             if (n < 0) {
@@ -710,9 +897,11 @@ int main(int argc, char **argv)
             return 1;
         if (report_clock(&now) != 0)
             return 1;
+        if (g_shares && shares_result(fd, mxguest_shares_service(g_shares, &read_set, now)) != 0)
+            return 1;
         if (now >= next_report) {
             if (send_hello(fd, MXGA_OP_HEARTBEAT) != 0 || send_stats(fd) != 0 ||
-                refresh_status(fd) != 0)
+                refresh_status(fd) != 0 || send_network(fd, 0) != 0)
                 return 1;
             next_report = now + 5000u;
         }

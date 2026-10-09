@@ -38,7 +38,8 @@ int main(void)
 {
     int channels[2], status;
     pid_t child, finished = 0;
-    uint8_t input[64], output[4096];
+    static uint8_t output[MXGA_MAX_FRAME_BYTES];
+    uint8_t input[64];
     uint32_t input_length;
     uint64_t start, now;
     unsigned hello = 0, stats = 0, heartbeat = 0, sent = 0;
